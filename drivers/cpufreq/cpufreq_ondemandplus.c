@@ -51,6 +51,7 @@
 #include <linux/kthread.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
+#include <linux/kernel_stat.h>
 #include <asm/cputime.h>
 
 #define CREATE_TRACE_POINTS
@@ -75,15 +76,10 @@ struct cpufreq_ondemandplus_cpuinfo {
 
 static DEFINE_PER_CPU(struct cpufreq_ondemandplus_cpuinfo, cpuinfo);
 
-/* Workqueues handle frequency scaling */
-static struct task_struct *up_task;
-static struct workqueue_struct *down_wq;
-static struct work_struct freq_scale_down_work;
-static cpumask_t up_cpumask;
-static spinlock_t up_cpumask_lock;
-static cpumask_t down_cpumask;
-static spinlock_t down_cpumask_lock;
-static struct mutex set_speed_lock;
+/* realtime thread handles frequency scaling */
+static struct task_struct *speedchange_task;
+static cpumask_t speedchange_cpumask;
+static spinlock_t speedchange_cpumask_lock;
 
 /*
  * Tunables start
@@ -95,7 +91,7 @@ static unsigned long timer_rate;
 #define DEFAULT_UP_THRESHOLD 87
 static unsigned long up_threshold;
 
-#define DEFAULT_DOWN_DIFFERENTIAL 54
+#define DEFAULT_DOWN_DIFFERENTIAL 58
 static unsigned long down_differential;
 
 #define DEFAULT_INTER_HIFREQ 1036800
@@ -110,10 +106,12 @@ static unsigned long inter_staycycles;
 #define DEFAULT_STAYCYCLES_RESETFREQ 450000
 static u64 staycycles_resetfreq;
 
+#define DEFAULT_IO_IS_BUSY 1
+static bool io_is_busy;
+
 /*
  * Tunables end
  */
-
 
 static int cpufreq_governor_ondemandplus(struct cpufreq_policy *policy,
 		unsigned int event);
@@ -128,6 +126,42 @@ struct cpufreq_governor cpufreq_gov_ondemandplus = {
 	.owner = THIS_MODULE,
 };
 
+static inline cputime64_t get_cpu_idle_time_jiffy(unsigned int cpu,
+						  cputime64_t *wall)
+{
+	u64 idle_time;
+	u64 cur_wall_time;
+	u64 busy_time;
+
+	cur_wall_time = jiffies64_to_cputime64(get_jiffies_64());
+
+	busy_time  = cputime64_add(busy_time, kstat_cpu(cpu).cpustat.user);
+	busy_time += cputime64_add(busy_time, kstat_cpu(cpu).cpustat.system);
+	busy_time += cputime64_add(busy_time, kstat_cpu(cpu).cpustat.irq);
+	busy_time += cputime64_add(busy_time, kstat_cpu(cpu).cpustat.softirq);
+	busy_time += cputime64_add(busy_time, kstat_cpu(cpu).cpustat.steal);
+	busy_time += cputime64_add(busy_time, kstat_cpu(cpu).cpustat.nice);
+
+	idle_time = cur_wall_time - busy_time;
+	if (wall)
+		*wall = jiffies_to_usecs(cur_wall_time);
+
+	return jiffies_to_usecs(idle_time);
+}
+
+static inline cputime64_t get_cpu_idle_time(unsigned int cpu,
+					    cputime64_t *wall)
+{
+	u64 idle_time = get_cpu_idle_time_us(cpu, wall);
+
+	if (idle_time == -1ULL)
+		idle_time = get_cpu_idle_time_jiffy(cpu, wall);
+	else if (!io_is_busy)
+		idle_time += get_cpu_iowait_time_us(cpu, wall);
+
+	return idle_time;
+}
+
 static void cpufreq_ondemandplus_timer(unsigned long data)
 {
 	unsigned int delta_idle;
@@ -140,10 +174,16 @@ static void cpufreq_ondemandplus_timer(unsigned long data)
 	struct cpufreq_ondemandplus_cpuinfo *pcpu =
 		&per_cpu(cpuinfo, data);
 	u64 now_idle;
-	unsigned int new_freq;
+	unsigned int new_freq = 0;
 	unsigned int index;
 	static unsigned int stay_counter;
 	unsigned long flags;
+	static unsigned int i = 0;
+	static unsigned int last_cpu_freqs[5];
+	static unsigned int avg_cpu_freq = 0;
+	static unsigned int lo_avg_cpu_freq;
+	static unsigned int hi_avg_cpu_freq;
+	static unsigned int low_timer_rate = 0;
 
 	smp_rmb();
 
@@ -162,7 +202,7 @@ static void cpufreq_ondemandplus_timer(unsigned long data)
 
 	time_in_idle = pcpu->time_in_idle;
 	idle_exit_time = pcpu->idle_exit_time;
-	now_idle = get_cpu_idle_time_us(data, &pcpu->timer_run_time);
+	now_idle = get_cpu_idle_time(data, &pcpu->timer_run_time);
 	smp_wmb();
 
 	/* If we raced with cancelling a timer, skip. */
@@ -334,19 +374,11 @@ static void cpufreq_ondemandplus_timer(unsigned long data)
 	pcpu->target_set_time_in_idle = now_idle;
 	pcpu->target_set_time = pcpu->timer_run_time;
 
-	if (new_freq < pcpu->target_freq) {
-		pcpu->target_freq = new_freq;
-		spin_lock_irqsave(&down_cpumask_lock, flags);
-		cpumask_set_cpu(data, &down_cpumask);
-		spin_unlock_irqrestore(&down_cpumask_lock, flags);
-		queue_work(down_wq, &freq_scale_down_work);
-	} else {
-		pcpu->target_freq = new_freq;
-		spin_lock_irqsave(&up_cpumask_lock, flags);
-		cpumask_set_cpu(data, &up_cpumask);
-		spin_unlock_irqrestore(&up_cpumask_lock, flags);
-		wake_up_process(up_task);
-	}
+	pcpu->target_freq = new_freq;
+	spin_lock_irqsave(&speedchange_cpumask_lock, flags);
+	cpumask_set_cpu(data, &speedchange_cpumask);
+	spin_unlock_irqrestore(&speedchange_cpumask_lock, flags);
+	wake_up_process(speedchange_task);
 
 rearm_if_notmax:
 	/*
@@ -380,13 +412,66 @@ rearm:
 			pcpu->timer_idlecancel = 1;
 		}
 
-		pcpu->time_in_idle = get_cpu_idle_time_us(
+		/*
+		 * Calculate the average CPU frequency of the last 5 timer
+		 * cycles. Then check if the new to-be-requested frequency
+		 * is within a divergent range of 15% for lower frequencies,
+		 * or is equal to the average for higher frequencies. 
+		 * If yes, slow down the timer. 
+		 */
+		if (i >= 4) {
+			unsigned int k;
+			for (k = 0; k <= 4; k++) {
+				avg_cpu_freq += last_cpu_freqs[k];
+			}
+			i = 0;
+			hi_avg_cpu_freq = ((avg_cpu_freq / 5) * 115) / 100;
+			lo_avg_cpu_freq = ((avg_cpu_freq / 5) * 100) / 115;
+
+			if (new_freq < inter_lofreq && hi_avg_cpu_freq > new_freq && 
+						lo_avg_cpu_freq < new_freq) {
+				if (max_capped != screen_off_max_freq)
+					low_timer_rate = timer_rate * 2;
+				else
+					low_timer_rate = timer_rate * 3;
+			} else if (new_freq >= inter_lofreq && avg_cpu_freq == new_freq) {
+				low_timer_rate = timer_rate * 2;
+			} else {
+				low_timer_rate = 0;
+			}
+		} else {
+			if (new_freq < inter_lofreq && (hi_avg_cpu_freq < new_freq ||
+						lo_avg_cpu_freq > new_freq))
+				low_timer_rate = 0;
+			else if (new_freq >= inter_lofreq && avg_cpu_freq != new_freq)
+				low_timer_rate = 0;
+		}
+
+		/* 
+		 * Re-arm timer
+		 */				
+		pcpu->time_in_idle = get_cpu_idle_time(
 			data, &pcpu->idle_exit_time);
-		mod_timer(&pcpu->cpu_timer,
-			  jiffies + usecs_to_jiffies(timer_rate));
+		if (!low_timer_rate) {
+			mod_timer(&pcpu->cpu_timer,
+				jiffies + usecs_to_jiffies(timer_rate));
+		} else {
+			mod_timer(&pcpu->cpu_timer,
+				jiffies + usecs_to_jiffies(low_timer_rate));
+		}
 	}
 
 exit:
+	/*
+	 * Write CPU frequency of new timer cycle into the correct
+	 * last_cpu_freqs array-field
+	 */
+	if (new_freq) {
+		static unsigned int last_cpu_freq_field;
+		last_cpu_freq_field = i % 5;
+		last_cpu_freqs[last_cpu_freq_field] = new_freq;
+		i++;
+	}
 	return;
 }
 
@@ -414,7 +499,7 @@ static void cpufreq_ondemandplus_idle_start(void)
 		 * the CPUFreq driver.
 		 */
 		if (!pending) {
-			pcpu->time_in_idle = get_cpu_idle_time_us(
+			pcpu->time_in_idle = get_cpu_idle_time(
 				smp_processor_id(), &pcpu->idle_exit_time);
 			pcpu->timer_idlecancel = 0;
 			mod_timer(&pcpu->cpu_timer,
@@ -465,7 +550,7 @@ static void cpufreq_ondemandplus_idle_end(void)
 	    pcpu->timer_run_time >= pcpu->idle_exit_time &&
 	    pcpu->governor_enabled) {
 		pcpu->time_in_idle =
-			get_cpu_idle_time_us(smp_processor_id(),
+			get_cpu_idle_time(smp_processor_id(),
 					     &pcpu->idle_exit_time);
 		pcpu->timer_idlecancel = 0;
 		mod_timer(&pcpu->cpu_timer,
@@ -474,7 +559,7 @@ static void cpufreq_ondemandplus_idle_end(void)
 
 }
 
-static int cpufreq_ondemandplus_up_task(void *data)
+static int cpufreq_ondemandplus_speedchange_task(void *data)
 {
 	unsigned int cpu;
 	cpumask_t tmp_mask;
@@ -483,22 +568,23 @@ static int cpufreq_ondemandplus_up_task(void *data)
 
 	while (1) {
 		set_current_state(TASK_INTERRUPTIBLE);
-		spin_lock_irqsave(&up_cpumask_lock, flags);
+		spin_lock_irqsave(&speedchange_cpumask_lock, flags);
 
-		if (cpumask_empty(&up_cpumask)) {
-			spin_unlock_irqrestore(&up_cpumask_lock, flags);
+		if (cpumask_empty(&speedchange_cpumask)) {
+			spin_unlock_irqrestore(&speedchange_cpumask_lock,
+						flags);
 			schedule();
 
 			if (kthread_should_stop())
 				break;
 
-			spin_lock_irqsave(&up_cpumask_lock, flags);
+			spin_lock_irqsave(&speedchange_cpumask_lock, flags);
 		}
 
 		set_current_state(TASK_RUNNING);
-		tmp_mask = up_cpumask;
-		cpumask_clear(&up_cpumask);
-		spin_unlock_irqrestore(&up_cpumask_lock, flags);
+		tmp_mask = speedchange_cpumask;
+		cpumask_clear(&speedchange_cpumask);
+		spin_unlock_irqrestore(&speedchange_cpumask_lock, flags);
 
 		for_each_cpu(cpu, &tmp_mask) {
 			unsigned int j;
@@ -509,8 +595,6 @@ static int cpufreq_ondemandplus_up_task(void *data)
 
 			if (!pcpu->governor_enabled)
 				continue;
-
-			mutex_lock(&set_speed_lock);
 
 			for_each_cpu(j, pcpu->policy->cpus) {
 				struct cpufreq_ondemandplus_cpuinfo *pjcpu =
@@ -524,55 +608,13 @@ static int cpufreq_ondemandplus_up_task(void *data)
 				__cpufreq_driver_target(pcpu->policy,
 							max_freq,
 							CPUFREQ_RELATION_H);
-			mutex_unlock(&set_speed_lock);
-			trace_cpufreq_ondemandplus_up(cpu, pcpu->target_freq,
-						     pcpu->policy->cur);
+			trace_cpufreq_ondemandplus_setspeed(cpu,
+						pcpu->target_freq,
+						pcpu->policy->cur);
 		}
 	}
 
 	return 0;
-}
-
-static void cpufreq_ondemandplus_freq_down(struct work_struct *work)
-{
-	unsigned int cpu;
-	cpumask_t tmp_mask;
-	unsigned long flags;
-	struct cpufreq_ondemandplus_cpuinfo *pcpu;
-
-	spin_lock_irqsave(&down_cpumask_lock, flags);
-	tmp_mask = down_cpumask;
-	cpumask_clear(&down_cpumask);
-	spin_unlock_irqrestore(&down_cpumask_lock, flags);
-
-	for_each_cpu(cpu, &tmp_mask) {
-		unsigned int j;
-		unsigned int max_freq = 0;
-
-		pcpu = &per_cpu(cpuinfo, cpu);
-		smp_rmb();
-
-		if (!pcpu->governor_enabled)
-			continue;
-
-		mutex_lock(&set_speed_lock);
-
-		for_each_cpu(j, pcpu->policy->cpus) {
-			struct cpufreq_ondemandplus_cpuinfo *pjcpu =
-				&per_cpu(cpuinfo, j);
-
-			if (pjcpu->target_freq > max_freq)
-				max_freq = pjcpu->target_freq;
-		}
-
-		if (max_freq != pcpu->policy->cur)
-			__cpufreq_driver_target(pcpu->policy, max_freq,
-						CPUFREQ_RELATION_H);
-
-		mutex_unlock(&set_speed_lock);
-		trace_cpufreq_ondemandplus_down(cpu, pcpu->target_freq,
-					       pcpu->policy->cur);
-	}
 }
 
 static ssize_t show_timer_rate(struct kobject *kobj,
@@ -787,6 +829,28 @@ static ssize_t store_staycycles_resetfreq(struct kobject *kobj,
 static struct global_attr staycycles_resetfreq_attr = __ATTR(staycycles_resetfreq, 0644,
 		show_staycycles_resetfreq, store_staycycles_resetfreq);
 
+static ssize_t show_io_is_busy(struct kobject *kobj,
+			struct attribute *attr, char *buf)
+{
+	return sprintf(buf, "%u\n", io_is_busy);
+}
+
+static ssize_t store_io_is_busy(struct kobject *kobj,
+			struct attribute *attr, const char *buf, size_t count)
+{
+	int ret;
+	unsigned long val;
+
+	ret = kstrtoul(buf, 0, &val);
+	if (ret < 0)
+		return ret;
+	io_is_busy = val;
+	return count;
+}
+
+static struct global_attr io_is_busy_attr = __ATTR(io_is_busy, 0644,
+		show_io_is_busy, store_io_is_busy);
+
 static struct attribute *ondemandplus_attributes[] = {
 	&timer_rate_attr.attr,
 	&up_threshold_attr.attr,
@@ -795,12 +859,33 @@ static struct attribute *ondemandplus_attributes[] = {
 	&inter_lofreq_attr.attr,
 	&inter_staycycles_attr.attr,
 	&staycycles_resetfreq_attr.attr,
+	&io_is_busy_attr.attr,
 	NULL,
 };
 
 static struct attribute_group ondemandplus_attr_group = {
 	.attrs = ondemandplus_attributes,
 	.name = "ondemandplus",
+};
+
+static int cpufreq_ondemandplus_idle_notifier(struct notifier_block *nb,
+					     unsigned long val,
+					     void *data)
+{
+	switch (val) {
+	case IDLE_START:
+		cpufreq_ondemandplus_idle_start();
+		break;
+	case IDLE_END:
+		cpufreq_ondemandplus_idle_end();
+		break;
+	}
+
+	return 0;
+}
+
+static struct notifier_block cpufreq_ondemandplus_idle_nb = {
+	.notifier_call = cpufreq_ondemandplus_idle_notifier,
 };
 
 static int cpufreq_governor_ondemandplus(struct cpufreq_policy *policy,
@@ -825,7 +910,7 @@ static int cpufreq_governor_ondemandplus(struct cpufreq_policy *policy,
 			pcpu->target_freq = policy->cur;
 			pcpu->freq_table = freq_table;
 			pcpu->target_set_time_in_idle =
-				get_cpu_idle_time_us(j,
+				get_cpu_idle_time(j,
 					     &pcpu->target_set_time);
 			pcpu->governor_enabled = 1;
 			smp_wmb();
@@ -843,6 +928,7 @@ static int cpufreq_governor_ondemandplus(struct cpufreq_policy *policy,
 		if (rc)
 			return rc;
 
+		idle_notifier_register(&cpufreq_ondemandplus_idle_nb);
 		break;
 
 	case CPUFREQ_GOV_STOP:
@@ -861,10 +947,10 @@ static int cpufreq_governor_ondemandplus(struct cpufreq_policy *policy,
 			pcpu->idle_exit_time = 0;
 		}
 
-		flush_work(&freq_scale_down_work);
 		if (atomic_dec_return(&active_count) > 0)
 			return 0;
 
+		idle_notifier_unregister(&cpufreq_ondemandplus_idle_nb);
 		sysfs_remove_group(cpufreq_global_kobject,
 				&ondemandplus_attr_group);
 
@@ -882,26 +968,6 @@ static int cpufreq_governor_ondemandplus(struct cpufreq_policy *policy,
 	return 0;
 }
 
-static int cpufreq_ondemandplus_idle_notifier(struct notifier_block *nb,
-					     unsigned long val,
-					     void *data)
-{
-	switch (val) {
-	case IDLE_START:
-		cpufreq_ondemandplus_idle_start();
-		break;
-	case IDLE_END:
-		cpufreq_ondemandplus_idle_end();
-		break;
-	}
-
-	return 0;
-}
-
-static struct notifier_block cpufreq_ondemandplus_idle_nb = {
-	.notifier_call = cpufreq_ondemandplus_idle_notifier,
-};
-
 static int __init cpufreq_ondemandplus_init(void)
 {
 	unsigned int i;
@@ -915,6 +981,7 @@ static int __init cpufreq_ondemandplus_init(void)
 	inter_lofreq = DEFAULT_INTER_LOFREQ;
 	inter_staycycles = DEFAULT_INTER_STAYCYCLES;
 	staycycles_resetfreq = DEFAULT_STAYCYCLES_RESETFREQ;
+	io_is_busy = DEFAULT_IO_IS_BUSY;
 
 	/* Initalize per-cpu timers */
 	for_each_possible_cpu(i) {
@@ -924,34 +991,22 @@ static int __init cpufreq_ondemandplus_init(void)
 		pcpu->cpu_timer.data = i;
 	}
 
-	up_task = kthread_create(cpufreq_ondemandplus_up_task, NULL,
-				 "kondemandplusup");
-	if (IS_ERR(up_task))
-		return PTR_ERR(up_task);
+	spin_lock_init(&speedchange_cpumask_lock);
+	speedchange_task =
+		kthread_create(cpufreq_ondemandplus_speedchange_task, NULL,
+				"cfondemandplus");
+	if (IS_ERR(speedchange_task))
+		return PTR_ERR(speedchange_task);
 
-	sched_setscheduler_nocheck(up_task, SCHED_FIFO, &param);
-	get_task_struct(up_task);
+	sched_setscheduler_nocheck(speedchange_task, SCHED_FIFO, &param);
+	get_task_struct(speedchange_task);
 
-	/* No rescuer thread, bind to CPU queuing the work for possibly
-	   warm cache (probably doesn't matter much). */
-	down_wq = alloc_workqueue("knteractive_down", 0, 1);
-
-	if (!down_wq)
-		goto err_freeuptask;
-
-	INIT_WORK(&freq_scale_down_work,
-		  cpufreq_ondemandplus_freq_down);
-
-	spin_lock_init(&up_cpumask_lock);
-	spin_lock_init(&down_cpumask_lock);
-	mutex_init(&set_speed_lock);
-
-	idle_notifier_register(&cpufreq_ondemandplus_idle_nb);
+	/* NB: wake up so the thread does not look hung to the freezer */
+	wake_up_process(speedchange_task);
 
 	return cpufreq_register_governor(&cpufreq_gov_ondemandplus);
 
-err_freeuptask:
-	put_task_struct(up_task);
+	put_task_struct(speedchange_task);
 	return -ENOMEM;
 }
 
@@ -964,9 +1019,8 @@ module_init(cpufreq_ondemandplus_init);
 static void __exit cpufreq_ondemandplus_exit(void)
 {
 	cpufreq_unregister_governor(&cpufreq_gov_ondemandplus);
-	kthread_stop(up_task);
-	put_task_struct(up_task);
-	destroy_workqueue(down_wq);
+	kthread_stop(speedchange_task);
+	put_task_struct(speedchange_task);
 }
 
 module_exit(cpufreq_ondemandplus_exit);
