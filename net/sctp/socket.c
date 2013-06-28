@@ -3922,17 +3922,19 @@ SCTP_STATIC int sctp_init_sock(struct sock *sk)
 /* Cleanup any SCTP per socket resources.  */
 SCTP_STATIC void sctp_destroy_sock(struct sock *sk)
 {
-	struct sctp_sock *sp;
+	struct sctp_endpoint *ep;
 
 	SCTP_DEBUG_PRINTK("sctp_destroy_sock(sk: %p)\n", sk);
 
 	/* Release our hold on the endpoint. */
-	sp = sctp_sk(sk);
-	if (sp->do_auto_asconf) {
-		sp->do_auto_asconf = 0;
-		list_del(&sp->auto_asconf_list);
-	}
-	sctp_endpoint_free(sp->ep);
+	ep = sctp_sk(sk)->ep;
+	/* This could happen during socket init, thus we bail out
+	 * early, since the rest of the below is not setup either.
+	 */
+	if (ep == NULL)
+		return;
+
+	sctp_endpoint_free(ep);
 	local_bh_disable();
 	percpu_counter_dec(&sctp_sockets_allocated);
 	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
