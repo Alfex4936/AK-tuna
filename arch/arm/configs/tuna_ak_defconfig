@@ -106,7 +106,7 @@ CONFIG_RQ_STATS=y
 #
 # Boot logo and Framebuffer
 #
-CONFIG_CMDLINE="console=ttyS0,115200 androidboot.console=ttyS0 fbcon=rotate:0 mem=1G vmalloc=256M omap_wdt.timer_margin=30 no_console_suspend"
+CONFIG_CMDLINE="console=ttyS0,115200 androidboot.console=ttyS0 fbcon=rotate:0 mem=1G vmalloc=480M omap_wdt.timer_margin=30 no_console_suspend"
 CONFIG_BOOT_PRINTK_DELAY=y
 CONFIG_CMDLINE_FORCE=y
 CONFIG_CMDLINE_EXTEND=y
@@ -547,10 +547,11 @@ CONFIG_SMP=y
 CONFIG_SMP_ON_UP=y
 CONFIG_HAVE_ARM_SCU=y
 CONFIG_HAVE_ARM_TWD=y
-CONFIG_VMSPLIT_3G=y
+CONFIG_VMSPLIT_TUNA_OPT=y
+# CONFIG_VMSPLIT_3G is not set
 # CONFIG_VMSPLIT_2G is not set
 # CONFIG_VMSPLIT_1G is not set
-CONFIG_PAGE_OFFSET=0xC0000000
+CONFIG_PAGE_OFFSET=0xA0000000
 CONFIG_NR_CPUS=2
 CONFIG_HOTPLUG_CPU=y
 CONFIG_LOCAL_TIMERS=y

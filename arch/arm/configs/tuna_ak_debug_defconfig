@@ -516,10 +516,11 @@ CONFIG_SMP=y
 CONFIG_SMP_ON_UP=y
 CONFIG_HAVE_ARM_SCU=y
 CONFIG_HAVE_ARM_TWD=y
-CONFIG_VMSPLIT_3G=y
+CONFIG_VMSPLIT_TUNA_OPT=y
+# CONFIG_VMSPLIT_3G is not set
 # CONFIG_VMSPLIT_2G is not set
 # CONFIG_VMSPLIT_1G is not set
-CONFIG_PAGE_OFFSET=0xC0000000
+CONFIG_PAGE_OFFSET=0xA0000000
 CONFIG_NR_CPUS=2
 CONFIG_HOTPLUG_CPU=y
 CONFIG_LOCAL_TIMERS=y
@@ -569,6 +570,10 @@ CONFIG_ARM_FLUSH_CONSOLE_ON_RESTART=y
 # CONFIG_USE_OF is not set
 CONFIG_ZBOOT_ROM_TEXT=0
 CONFIG_ZBOOT_ROM_BSS=0
+<<<<<<< HEAD:arch/arm/configs/tuna_ak_debug_defconfig
+=======
+CONFIG_CMDLINE="console=ttyFIQ0 androidboot.console=ttyFIQ0 mem=1G vmalloc=480M omap_wdt.timer_margin=30 no_console_suspend"
+>>>>>>> abb2885... arch/arm: introduce Tuna optimized VMSPLIT of 2.5G/1.5G:arch/arm/configs/amperific_tuna_defconfig
 # CONFIG_CMDLINE_FROM_BOOTLOADER is not set
 # CONFIG_XIP_KERNEL is not set
 # CONFIG_KEXEC is not set
