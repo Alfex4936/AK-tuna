@@ -237,7 +237,7 @@ static void neigh_flush_dev(struct neigh_table *tbl, struct net_device *dev)
 				   we must kill timers etc. and move
 				   it to safe state.
 				 */
-				skb_queue_purge(&n->arp_queue);
+				__skb_queue_purge(&n->arp_queue);
 				n->output = neigh_blackhole;
 				if (n->nud_state & NUD_VALID)
 					n->nud_state = NUD_NOARP;
@@ -291,7 +291,7 @@ static struct neighbour *neigh_alloc(struct neigh_table *tbl)
 	if (!n)
 		goto out_entries;
 
-	skb_queue_head_init(&n->arp_queue);
+	__skb_queue_head_init(&n->arp_queue);
 	rwlock_init(&n->lock);
 	seqlock_init(&n->ha_lock);
 	n->updated	  = n->used = now;
@@ -689,6 +689,8 @@ static void neigh_destroy_rcu(struct rcu_head *head)
  */
 void neigh_destroy(struct neighbour *neigh)
 {
+	struct hh_cache *hh;
+
 	NEIGH_CACHE_STAT_INC(neigh->tbl, destroys);
 
 	if (!neigh->dead) {
@@ -701,7 +703,19 @@ void neigh_destroy(struct neighbour *neigh)
 	if (neigh_del_timer(neigh))
 		printk(KERN_WARNING "Impossible event.\n");
 
-	skb_queue_purge(&neigh->arp_queue);
+	while ((hh = neigh->hh) != NULL) {
+		neigh->hh = hh->hh_next;
+		hh->hh_next = NULL;
+
+		write_seqlock_bh(&hh->hh_lock);
+		hh->hh_output = neigh_blackhole;
+		write_sequnlock_bh(&hh->hh_lock);
+		hh_cache_put(hh);
+	}
+
+	write_lock_bh(&neigh->lock);
+	__skb_queue_purge(&neigh->arp_queue);
+	write_unlock_bh(&neigh->lock);
 
 	dev_put(neigh->dev);
 	neigh_parms_put(neigh->parms);
@@ -841,7 +855,7 @@ static void neigh_invalidate(struct neighbour *neigh)
 		neigh->ops->error_report(neigh, skb);
 		write_lock(&neigh->lock);
 	}
-	skb_queue_purge(&neigh->arp_queue);
+	__skb_queue_purge(&neigh->arp_queue);
 }
 
 /* Called when a timer expires for a neighbour entry. */
@@ -1162,7 +1176,7 @@ int neigh_update(struct neighbour *neigh, const u8 *lladdr, u8 new,
 			n1->output(n1, skb);
 			write_lock_bh(&neigh->lock);
 		}
-		skb_queue_purge(&neigh->arp_queue);
+		__skb_queue_purge(&neigh->arp_queue);
 	}
 out:
 	if (update_isrouter) {
