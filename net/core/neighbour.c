@@ -703,19 +703,7 @@ void neigh_destroy(struct neighbour *neigh)
 	if (neigh_del_timer(neigh))
 		printk(KERN_WARNING "Impossible event.\n");
 
-	while ((hh = neigh->hh) != NULL) {
-		neigh->hh = hh->hh_next;
-		hh->hh_next = NULL;
-
-		write_seqlock_bh(&hh->hh_lock);
-		hh->hh_output = neigh_blackhole;
-		write_sequnlock_bh(&hh->hh_lock);
-		hh_cache_put(hh);
-	}
-
-	write_lock_bh(&neigh->lock);
 	__skb_queue_purge(&neigh->arp_queue);
-	write_unlock_bh(&neigh->lock);
 
 	dev_put(neigh->dev);
 	neigh_parms_put(neigh->parms);
