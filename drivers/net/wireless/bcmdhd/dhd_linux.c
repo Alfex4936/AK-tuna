@@ -362,7 +362,6 @@ uint dhd_arp_enable = TRUE;
 module_param(dhd_arp_enable, uint, 0);
 
 /* ARP offload agent mode : Enable ARP Host Auto-Reply and ARP Peer Auto-Reply */
-
 uint dhd_arp_mode = ARP_OL_AGENT | ARP_OL_PEER_AUTO_REPLY;
 
 module_param(dhd_arp_mode, uint, 0);
@@ -389,6 +388,11 @@ module_param(dhd_watchdog_ms, uint, 0);
 uint dhd_console_ms = 0;
 module_param(dhd_console_ms, uint, 0644);
 #endif /* defined(DHD_DEBUG) */
+
+#if defined(CONFIG_HAS_EARLYSUSPEND)
+bool wifi_fast = false;
+module_param(wifi_fast, bool, 0644);
+#endif
 
 uint dhd_slpauto = TRUE;
 module_param(dhd_slpauto, uint, 0);
@@ -698,14 +702,16 @@ module_param(wifi_pm, int, 0755);
 
 static int dhd_set_suspend(int value, dhd_pub_t *dhd)
 {
-#ifndef SUPPORT_PM2_ONLY
+#if !defined(SUPPORT_PM2_ONLY)
 	int power_mode = PM_MAX;
 #endif /* SUPPORT_PM2_ONLY */
 	/* wl_pkt_filter_enable_t	enable_parm; */
 	char iovbuf[32];
 	int bcn_li_dtim = 0; /* Default bcn_li_dtim in resume mode is 0 */
-#ifndef ENABLE_FW_ROAM_SUSPEND
 	uint roamvar = 1;
+#if !defined(SUPPORT_PM2_ONLY)
+  if (wifi_fast)
+      power_mode = PM_FAST;
 #endif /* ENABLE_FW_ROAM_SUSPEND */
 
 	if (!dhd)
@@ -729,7 +735,7 @@ static int dhd_set_suspend(int value, dhd_pub_t *dhd)
 				/* Kernel suspended */
 				DHD_ERROR(("%s: force extra Suspend setting \n", __FUNCTION__));
 
-#ifndef SUPPORT_PM2_ONLY
+#if !defined(SUPPORT_PM2_ONLY)
 				dhd_wl_ioctl_cmd(dhd, WLC_SET_PM, (char *)&power_mode,
 				                 sizeof(power_mode), TRUE, 0);
 #endif /* SUPPORT_PM2_ONLY */
@@ -762,7 +768,7 @@ static int dhd_set_suspend(int value, dhd_pub_t *dhd)
 				/* Kernel resumed  */
 				DHD_ERROR(("%s: Remove extra suspend setting \n", __FUNCTION__));
 
-#ifndef SUPPORT_PM2_ONLY
+#if !defined(SUPPORT_PM2_ONLY)
 				power_mode = PM_FAST;
 				dhd_wl_ioctl_cmd(dhd, WLC_SET_PM, (char *)&power_mode,
 				                 sizeof(power_mode), TRUE, 0);
