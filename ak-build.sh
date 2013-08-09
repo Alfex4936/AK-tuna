@@ -53,7 +53,7 @@ else
   #
   # LOCAL KERNEL VERSION
   #
-  ak_ver="AK.300.SKL"; export LOCALVERSION="~"`echo $ak_ver`
+  ak_ver="AK.JB43.007"; export LOCALVERSION="~"`echo $ak_ver`
 
   debug=0
 
@@ -62,8 +62,8 @@ fi
 #
 # CROSS COMPILE KERNEL MODULES
 #
-#make CROSS_COMPILE=$TOOLCHAIN_GOOGLE ARCH=arm -j16 modules
-make CROSS_COMPILE=$TOOLCHAIN_LINARO ARCH=arm -j16 modules
+#make CROSS_COMPILE=$TOOLCHAIN_GOOGLE ARCH=arm -j4 modules
+make CROSS_COMPILE=$TOOLCHAIN_LINARO ARCH=arm -j4 modules
 
 #
 # FIND .KO MODULE CREATE WITH CROSS COMPILE
@@ -78,21 +78,21 @@ echo ""
 #
 # CROSS COMPILE KERNEL WITH TOOLCHAIN
 #
-#make CROSS_COMPILE=$TOOLCHAIN_GOOGLE ARCH=arm -j16 zImage
-make CROSS_COMPILE=$TOOLCHAIN_LINARO ARCH=arm -j16 zImage
+#make CROSS_COMPILE=$TOOLCHAIN_GOOGLE ARCH=arm -j4 zImage
+make CROSS_COMPILE=$TOOLCHAIN_LINARO ARCH=arm -j4 zImage
 
 #
 # COPY ZIMAGE OF KERNEL
 # FOR MERGE WITH RAMDISK
 #
 cp -vr arch/arm/boot/zImage ../AK-ramdisk/
-cd ../AK-ramdisk/ramdisk-4.2/
+cd ../AK-ramdisk/ramdisk-4.3/
 chmod 750 init* charger
 chmod 644 default.prop
 chmod 640 fstab.tuna
 chmod 644 ueventd*
 cd ..
-./repack-bootimg.pl zImage ramdisk-4.2/ boot.img
+./repack-bootimg.pl zImage ramdisk-4.3/ boot.img
 cp -vr boot.img cwm/
 
 #
@@ -102,7 +102,7 @@ cp -vr boot.img cwm/
 cd cwm
 zip -r `echo $ak_ver`.zip *
 rm -rf $CWM_MOVE/`echo $ak_ver`.zip
-cp -vr `echo $ak_ver`.zip $CWM_MOVE/AK-kernel/
+cp -vr `echo $ak_ver`.zip $CWM_MOVE/AK-kernel/JB43/
 if [ ! -d ../zip ]; then
  mkdir ../zip
 fi
